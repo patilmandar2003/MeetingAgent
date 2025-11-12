@@ -1,4 +1,7 @@
 import base64
+import os
+import subprocess
+import tempfile
 from typing import List, TypedDict, Annotated, Optional, Dict, Any
 from langchain_ollama import OllamaLLM
 from langchain_core.messages import AnyMessage, SystemMessage, HumanMessage
@@ -13,7 +16,9 @@ from IPython.display import Image, display
 import re
 import streamlit as st
 import whisper
+import torch
 
+# Define MeetingAgent state
 class MeetingAgent(TypedDict, total=False):
     agenda: Optional[str]
     tasks: Optional[str]
@@ -21,12 +26,18 @@ class MeetingAgent(TypedDict, total=False):
     meetingFile: Optional[str]
     fileData: Optional[str]
 
+# Clear GPU cache
+torch.cuda.empty_cache()
+
 # Initialize model
 model = OllamaLLM(model='phi3:mini')
 
 # Initialize audio to text model
-whisper_model = whisper.load_model("small")
+@st.cache_resource
+def load_whisper():
+    return whisper.load_model("small")
 
+whisper_model = load_whisper()
 # Setting Streamlit UI
 st.set_page_config(page_title="Meeting Agent", page_icon=":robot_face:", layout="centered")
 st.title("Meeting Agent 🤖")
@@ -102,9 +113,40 @@ def ProcessAVFile(state: MeetingAgent):
     # print("Processing AV File")
     file = state['meetingFile']
 
-    # transcription = model.transcribe(file)
-    with st.spinner("Transcribing audio/video using Whisper..."):
-        transcription = whisper_model.transcribe(file)["text"]
+    st.info("🎧 Processing audio/video file...")
+
+    # Step 1. Validate file existence
+    if not os.path.exists(file) or os.path.getsize(file) == 0:
+        st.error("Uploaded audio/video file is empty or missing.")
+        st.stop()
+
+    # Step 2. Convert video → audio (if needed)
+    audio_path = file
+    if not file.lower().endswith((".mp3", ".wav", ".m4a")):
+        st.write("🔄 Extracting audio from video file...")
+        temp_wav = tempfile.NamedTemporaryFile(delete=False, suffix=".wav").name
+        command = [
+            "ffmpeg", "-y", "-i", file,
+            "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le", temp_wav,
+            "-loglevel", "error"
+        ]
+        try:
+            subprocess.run(command, check=True)
+            audio_path = temp_wav
+        except subprocess.CalledProcessError as e:
+            st.error("Error: Could not extract audio using ffmpeg.")
+            st.stop()
+
+    # Step 3. Transcribe with Whisper safely
+    with st.spinner("🔊 Transcribing..."):
+        try:
+            transcription = whisper_model.transcribe(audio_path, fp16=False)
+            if not transcription or 'text' not in transcription:
+                raise ValueError("Whisper returned empty text.")
+            return {'fileData': transcription["text"]}
+        except Exception as e:
+            st.error(f"Transcription failed: {e}")
+            st.stop()
 
     return {'fileData': transcription}
 
