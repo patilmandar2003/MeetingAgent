@@ -27,15 +27,35 @@ model = OllamaLLM(model='phi3:mini')
 # Initialize audio to text model
 whisper_model = whisper.load_model("small")
 
+# Setting Streamlit UI
+st.set_page_config(page_title="Meeting Agent", page_icon=":robot_face:", layout="centered")
+st.title("Meeting Agent 🤖")
+
+st.write("Upload your meeting file (text, pdf, audio) and get a concise summary of discussion and tasks.")
+
+# File upload
+uploaded_file = st.file_uploader("Upload meeting File", 
+                               type=['txt', 'pdf', 'mp3', 'wav', 'm4a'])
+
 def DataCapture(state: MeetingAgent):
-    print("File selected")
-    upload_file = "./meeting_transcript.pdf"
-    # upload_file = st.file_uploader("Upload meeting File", type=['txt', 'pdf', 'mp3', 'wav', 'm4a'])
+    # print("File selected")
+    # upload_file = "./meeting_transcript.pdf"
+    # # upload_file = st.file_uploader("Upload meeting File", type=['txt', 'pdf', 'mp3', 'wav', 'm4a'])
     
-    return {'meetingFile': upload_file}
+    # return {'meetingFile': upload_file}
+
+    if uploaded_file:
+        # Save file temporarily
+        temp_path = f"./temp_{uploaded_file.name}"
+        with open(temp_path, "wb") as f:
+            f.write(uploaded_file.read())
+        return {'meetingFile': temp_path}
+    else:
+        st.warning("Please upload a file to continue.")
+        st.stop()
 
 def SortFile(state: MeetingAgent):
-    print("Sorting File")
+    # print("Sorting File")
     upload_file = state['meetingFile']
 
     if upload_file.endswith('.txt'):
@@ -46,22 +66,23 @@ def SortFile(state: MeetingAgent):
         return "whisper"
 
 def ProcessTextFile(state: MeetingAgent):
-    print("Processing Text file")
+    # print("Processing Text file")
     file_data = state['meetingFile']
 
     try:
         with open(file_data, "r") as file:
             content = file.read()
-            print(content)
-    except FileNotFoundError:
-        print("Error: The file 'your_file_name.txt' was not found.")
+            # print(content)
+    # except FileNotFoundError:
+    #     print("Error: The file 'your_file_name.txt' was not found.")
     except Exception as e:
-        print(f"An error occurred: {e}")
+        st.error(f"Error reading text file: {e}")
+        st.stop()
 
     return {'fileData': content}
 
 def ProcessPDFFile(state: MeetingAgent):
-    print("Processing pdf file")
+    # print("Processing pdf file")
     file= PyPDFLoader((state['meetingFile']))
 
     async def load_pages(loader: PyPDFLoader) -> List[Document]:
@@ -73,38 +94,42 @@ def ProcessPDFFile(state: MeetingAgent):
             return pages
 
     meeting_pages = asyncio.run(load_pages(file))
+    combined_text = "\n".join([page.page_content for page in meeting_pages])
 
-    return {'fileData': meeting_pages}
+    return {'fileData': combined_text}
 
 def ProcessAVFile(state: MeetingAgent):
-    print("Processing AV File")
+    # print("Processing AV File")
     file = state['meetingFile']
 
-    transcription = model.transcribe(file)
+    # transcription = model.transcribe(file)
+    with st.spinner("Transcribing audio/video using Whisper..."):
+        transcription = whisper_model.transcribe(file)["text"]
 
     return {'fileData': transcription}
 
 def SummarizeMeeting(state: MeetingAgent):
-    print("Summarizing meeting")
+    # print("Summarizing meeting")
+    st.subheader("🔍 Summarizing Meeting...")
     data = state['fileData']
 
     prompt = f"""
-        Summarize meeting details as given:
-        meeting details: {data}
+    Summarize the following meeting transcript:
+    {data}
 
-        Summarize the entire meeting details and extract important information.
-        Give output in multiple section such as:
-        1. Important discussions
-        2. Tasks given to employees and deadline
-
-        The summary should be very concise and up to the point. 
+    Provide a concise summary divided into:
+    1. Key Discussions
+    2. Tasks and Deadlines
+    3. Important Decisions
     """
 
     messages = [HumanMessage(content=prompt)]
     response = model.invoke(messages)
 
     print(response)
-
+    st.success("✅ Summary generated!")
+    st.markdown("### 📝 Meeting Summary:")
+    st.write(response)
     return {}
 
 # Create graph
@@ -136,6 +161,10 @@ meeting_graph.add_edge('SummarizeMeeting', END)
 # Compile graph
 compiled_graph = meeting_graph.compile()
 
-meeting_agent = compiled_graph.invoke({})
+# meeting_agent = compiled_graph.invoke({})
 
-# I am on branch UI now
+# Run when file is uploaded
+if uploaded_file is not None:
+    if st.button("🚀 Process and Summarize Meeting"):
+        with st.spinner("Processing..."):
+            compiled_graph.invoke({})
