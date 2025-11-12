@@ -1,10 +1,11 @@
 import base64
 import os
+import json
 import subprocess
 import tempfile
 from typing import List, TypedDict, Annotated, Optional, Dict, Any
 from langchain_ollama import OllamaLLM
-from langchain_core.messages import AnyMessage, SystemMessage, HumanMessage
+from langchain_core.messages import AnyMessage, SystemMessage, HumanMessage, AIMessage
 from langgraph.graph.message import add_messages
 from langgraph.graph import START, END, StateGraph
 from langgraph.prebuilt import ToolNode, tools_condition
@@ -25,6 +26,7 @@ class MeetingAgent(TypedDict, total=False):
     deadline: Optional[str]
     meetingFile: Optional[str]
     fileData: Optional[str]
+    summary: Optional[str]
 
 # Clear GPU cache
 torch.cuda.empty_cache()
@@ -38,6 +40,7 @@ def load_whisper():
     return whisper.load_model("small")
 
 whisper_model = load_whisper()
+
 # Setting Streamlit UI
 st.set_page_config(page_title="Meeting Agent", page_icon=":robot_face:", layout="centered")
 st.title("Meeting Agent 🤖")
@@ -46,7 +49,13 @@ st.write("Upload your meeting file (text, pdf, audio) and get a concise summary 
 
 # File upload
 uploaded_file = st.file_uploader("Upload meeting File", 
-                               type=['txt', 'pdf', 'mp3', 'wav', 'm4a'])
+                               type=['txt', 'pdf', 'mp3', 'wav', 'm4a', 'mp4', 'mov', 'avi'])
+
+# Save transcript of meeting
+def save_transcript(meeting_id, transcript_text):
+    os.makedirs("data/transcripts", exist_ok=True)
+    with open(f"data/transcripts/{meeting_id}.json", "w") as f:
+        json.dump({"id": meeting_id, "text": transcript_text}, f)
 
 def DataCapture(state: MeetingAgent):
     # print("File selected")
@@ -120,25 +129,33 @@ def ProcessAVFile(state: MeetingAgent):
         st.error("Uploaded audio/video file is empty or missing.")
         st.stop()
 
-    # Step 2. Convert video → audio (if needed)
+    # Step 2. Handle file type
+    file_ext = os.path.splitext(file)[1].lower()
+    audio_extensions = (".mp3", ".wav", ".m4a", ".flac", ".ogg")
+
+    # Step 3. Extract audio if it's a video
     audio_path = file
-    if not file.lower().endswith((".mp3", ".wav", ".m4a")):
-        st.write("🔄 Extracting audio from video file...")
+    temp_wav = None
+
+    if file_ext not in audio_extensions:
+        # st.write("🎬 Detected video file — extracting audio using FFmpeg...")
         temp_wav = tempfile.NamedTemporaryFile(delete=False, suffix=".wav").name
+
         command = [
             "ffmpeg", "-y", "-i", file,
-            "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le", temp_wav,
-            "-loglevel", "error"
+            "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le",
+            temp_wav, "-loglevel", "error"
         ]
+
         try:
             subprocess.run(command, check=True)
             audio_path = temp_wav
-        except subprocess.CalledProcessError as e:
-            st.error("Error: Could not extract audio using ffmpeg.")
+        except subprocess.CalledProcessError:
+            st.error("❌ FFmpeg failed to extract audio. Make sure FFmpeg is installed.")
             st.stop()
 
-    # Step 3. Transcribe with Whisper safely
-    with st.spinner("🔊 Transcribing..."):
+    # Step 4. Transcribe safely with Whisper
+    with st.spinner("🔊 Transcribing with Whisper..."):
         try:
             transcription = whisper_model.transcribe(audio_path, fp16=False)
             if not transcription or 'text' not in transcription:
@@ -147,6 +164,11 @@ def ProcessAVFile(state: MeetingAgent):
         except Exception as e:
             st.error(f"Transcription failed: {e}")
             st.stop()
+        finally:
+            # Clean up temp file if it was created
+            if temp_wav and os.path.exists(temp_wav):
+                os.remove(temp_wav)
+
 
     return {'fileData': transcription}
 
@@ -172,6 +194,47 @@ def SummarizeMeeting(state: MeetingAgent):
     st.success("✅ Summary generated!")
     st.markdown("### 📝 Meeting Summary:")
     st.write(response)
+
+    # Save summary of meeting
+    save_transcript("meeting_summary", response)
+
+    return {'summary': response}
+
+def AskMeetingQuestions(state: MeetingAgent):
+    st.subheader("❓ Ask Questions About the Meeting...")
+    
+    # Persistent chat history
+    if "chat_history" not in st.session_state:
+        st.session_state.chat_history = []
+
+    # Show chat messages
+    for message in st.session_state.chat_history:
+        role = "👤 You" if isinstance(message, HumanMessage) else "🤖 Assistant"
+        st.markdown(f"**{role}:** {message.content}")
+
+    # Input box — pressing Enter automatically triggers rerun
+    question = st.text_input("Ask a question about the meeting:", key="user_input")
+
+    if question:
+        # Append user message
+        st.session_state.chat_history.append(HumanMessage(content=question))
+
+        # Get response from model
+        response = model.invoke([HumanMessage(content=question)])
+        answer = response.content if hasattr(response, "content") else str(response)
+
+        # Append AI response
+        st.session_state.chat_history.append(AIMessage(content=answer))
+
+        # Save the interaction
+        save_transcript(f"meeting_question_{question}", answer)
+
+        # Clear input box
+        st.session_state.user_input = ""
+
+        # Trigger rerun to show updated messages
+        st.rerun()
+
     return {}
 
 # Create graph
@@ -184,6 +247,7 @@ meeting_graph.add_node('ProcessTextFile', ProcessTextFile)
 meeting_graph.add_node('ProcessPDFFile', ProcessPDFFile)
 meeting_graph.add_node('ProcessAVFile', ProcessAVFile)
 meeting_graph.add_node('SummarizeMeeting', SummarizeMeeting)
+meeting_graph.add_node('AskMeetingQuestions', AskMeetingQuestions)
 
 # Add edges
 meeting_graph.add_edge(START, 'DataCapture')
@@ -198,7 +262,8 @@ meeting_graph.add_conditional_edges('DataCapture',
 meeting_graph.add_edge('ProcessTextFile', 'SummarizeMeeting')
 meeting_graph.add_edge('ProcessPDFFile', 'SummarizeMeeting')
 meeting_graph.add_edge('ProcessAVFile', 'SummarizeMeeting')
-meeting_graph.add_edge('SummarizeMeeting', END)
+meeting_graph.add_edge('SummarizeMeeting', "AskMeetingQuestions")
+meeting_graph.add_edge('AskMeetingQuestions', END)
 
 # Compile graph
 compiled_graph = meeting_graph.compile()
